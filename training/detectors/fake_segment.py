@@ -1,0 +1,429 @@
+import os
+import time
+import logging
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import AutoProcessor, CLIPModel
+from .base_detector import AbstractDetector
+from detectors import DETECTOR
+from loss import LOSSFUNC
+from metrics.base_metrics_class import calculate_metrics_for_train
+
+logger = logging.getLogger(__name__)
+
+
+@DETECTOR.register_module(module_name='clip_fine_text')
+class CLIP16x16Segmentor(AbstractDetector):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.lmdb = config.get('lmdb', False)
+
+        # 1) 初始化 CLIP
+        self.processor, self.model = self.build_clip_model(config)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = self.model.to(self.device)
+
+        # 2) 从 CLIP 配置中读 image_size / patch_size
+        vision_cfg = self.model.vision_model.config
+        self.image_size = vision_cfg.image_size       # 通常 224
+        self.patch_size = vision_cfg.patch_size       # 通常 16
+        self.seg_size = self.image_size // self.patch_size  # 224/16=14
+        self.target_num_patches = self.seg_size * self.seg_size  # 14*14=196
+
+        # hidden_size / projection_dim
+        self.feat_dim = vision_cfg.hidden_size             # 768
+        self.proj_dim = self.model.config.projection_dim   # 512
+        clip_proj = self.model.visual_projection   # Parameter: [hidden, proj]
+        self.projection = nn.Linear(768, 512,bias = (clip_proj.bias is not None)).to(self.device)
+        # self.projection.load_state_dict(clip_proj.state_dict())
+
+
+        clip_text_proj = self.model.text_projection  # 可能是 Linear，也可能是 Parameter
+        hidden_dim = self.model.text_model.config.hidden_size
+        proj_dim = self.model.config.projection_dim
+
+        # 1) 两个 projector 结构完全一致
+        self.patch_text_proj = nn.Linear(hidden_dim, proj_dim, bias=False).to(self.device)
+        self.face_text_proj  = nn.Linear(hidden_dim, proj_dim, bias=False).to(self.device)
+
+        # 2) 从 CLIP 的 text_projection 拷权重
+        with torch.no_grad():
+            if isinstance(clip_text_proj, nn.Linear):
+                # open_clip 这类实现
+                w = clip_text_proj.weight.data.clone()       # [proj_dim, hidden_dim]
+                self.patch_text_proj.weight.copy_(w)
+                self.face_text_proj.weight.copy_(w)
+            else:
+                # HF CLIP: text_projection 是 nn.Parameter [hidden_dim, proj_dim]
+                # CLIP 原始做法是 x @ text_projection
+                w = clip_text_proj.data.clone().T            # 变成 [proj_dim, hidden_dim]
+                self.patch_text_proj.weight.copy_(w)
+                self.face_text_proj.weight.copy_(w)
+
+
+        
+        
+        self.loss_func = self.build_loss(config)
+
+        # 文本 prompt
+        self.real_face_text = "this is a real face"
+        self.fake_face_text = "this is a fake face"
+        self.real_text = "this is a real region"
+        self.fake_text = "this is a fake region"
+
+        # mask 保存路径
+        self.mask_save_path = '/media/ubuntu/3c90d67b-86b3-4bcc-b52e-138d569789d9/LYH-data/DeepfakeBench/mask_image'
+
+    # =================== CLIP 构建 ===================
+
+    def build_clip_model(self, config):
+        model_name = "openai/clip-vit-base-patch16"
+        processor = AutoProcessor.from_pretrained(model_name)
+        model = CLIPModel.from_pretrained(model_name)
+        return processor, model
+
+    # 文本特征：已经过 text_projection，是 projection_dim
+    # def get_text_features(self):
+    #     inputs = self.processor(
+    #         text=[self.real_text, self.fake_text, self.real_face_text, self.fake_face_text],
+    #         return_tensors="pt",
+    #         padding=True
+    #     )
+    #     inputs = {k: v.to(self.device) for k, v in inputs.items()}
+    #     text_features = self.model.get_text_features(**inputs)      # [4, proj_dim]
+    #     text_features = F.normalize(text_features, dim=-1)
+
+    #     real_patch = text_features[0]   # [D]
+    #     fake_patch = text_features[1]
+    #     real_face = text_features[2]
+    #     fake_face = text_features[3]
+    #      return real_patch, fake_patch, real_face, fake_face
+
+    def get_text_features(self):
+        inputs = self.processor(
+            text=[self.real_text, self.fake_text, self.real_face_text, self.fake_face_text],
+            return_tensors="pt",
+            padding=True
+        )
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        # 原始 text encoder 输出（未 projection）
+        raw = self.model.text_model(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            return_dict=True
+        ).pooler_output  # [4, hidden]
+
+
+        patch_raw = raw[:2, :]   # [2, hidden]  -> region 文本
+        face_raw  = raw[2:, :]   # [2, hidden]  -> face 文本
+
+        # 分别用不同 projector
+        patch_feat = self.patch_text_proj(patch_raw)  # [2, proj_dim]
+        face_feat  = self.face_text_proj(face_raw)    # [2, proj_dim]
+
+        # 归一化
+        patch_feat = F.normalize(patch_feat, dim=-1)
+        face_feat  = F.normalize(face_feat, dim=-1)
+
+        real_patch = patch_feat[0]
+        fake_patch = patch_feat[1]
+        real_face  = face_feat[0]
+        fake_face  = face_feat[1]
+
+        return real_patch, fake_patch, real_face, fake_face
+
+
+
+    # 图像 patch / CLS 特征：用 vision_model + visual_projection
+    def get_image_patch_features(self, image):
+        if isinstance(image, torch.Tensor) and image.device != self.device:
+            image = image.to(self.device)
+
+        # 这里假设 data_dict["image"] 已经按 CLIP 要求预处理了
+        outputs = self.model.vision_model(image, output_hidden_states=True)
+        hidden = outputs.last_hidden_state           # [B, 1+P, hidden_size]
+
+        cls_features = hidden[:, 0, :]              # [B, H]
+        patch_features = hidden[:, 1:, 0:768]           # [B, P, H]
+
+        # 用 CLIP 自带的 visual_projection：hidden_size -> proj_dim
+        visual_proj = self.model.visual_projection   # Linear(H, proj_dim)
+        patch_features = self.projection(patch_features) # [B, P, D]
+        cls_features = visual_proj(cls_features)     # [B, D]
+
+        # 归一化
+        patch_features = F.normalize(patch_features, dim=-1)
+        cls_features = F.normalize(cls_features, dim=-1)
+
+        return patch_features, cls_features
+
+    # =================== 前向 ===================
+
+    def forward(self, data_dict: dict, inference=False) -> dict:
+        images = data_dict['image']
+        patch_features, cls_features = self.features(images)
+        patch_logits, patch_prob, cls_logits, cls_prob = self.classifier(
+            patch_features, cls_features
+        )
+        pred_dict = {
+            'cls': cls_logits,
+            'prob': cls_prob,
+            'feat': cls_features,
+            'patch_cls': patch_logits,
+            'patch_prob': patch_prob,
+            'patch_feat': patch_features,
+        }
+        return pred_dict
+
+    def features(self, x):
+        return self.get_image_patch_features(x)
+
+    def get_masks(self, data_dict: dict):
+        return data_dict['mask']
+
+    def build_backbone(self, config):
+        return self.model.vision_model
+
+    def build_loss(self, config):
+        loss_class = LOSSFUNC[config['loss_func']]
+        return loss_class()
+
+    # =================== classifier：对比 patch/text ===================
+
+    def classifier(self, patch_features, cls_features):
+        """
+        patch_features: [B, P, D]
+        cls_features:   [B, D]
+        返回：
+          patch_logits_flat: [B*P, 2]
+          patch_prob:        [B*P] (fake 概率)
+          cls_logits:        [B, 2]
+          cls_prob:          [B]   (fake 概率)
+        """
+        B, P, D = patch_features.shape
+
+        real_patch, fake_patch, real_face, fake_face = self.get_text_features()
+        real_patch = real_patch.to(self.device)
+        fake_patch = fake_patch.to(self.device)
+        real_face = real_face.to(self.device)
+        fake_face = fake_face.to(self.device)
+
+        # 为广播 reshape
+        real_patch = real_patch.view(1, 1, D)   # [1,1,D]
+        fake_patch = fake_patch.view(1, 1, D)
+        real_face = real_face.view(1, D)        # [1,D]
+        fake_face = fake_face.view(1, D)
+
+        # ---- patch 级别相似度 ----
+        real_sim = torch.sum(patch_features * real_patch, dim=-1)   # [B,P]
+        fake_sim = torch.sum(patch_features * fake_patch, dim=-1)   # [B,P]
+
+        patch_logits = torch.stack([real_sim, fake_sim], dim=-1)    # [B,P,2]
+        patch_logits_flat = patch_logits.reshape(-1, 2)             # [B*P,2]
+        patch_prob = torch.softmax(patch_logits_flat, dim=1)[:, 1]  # fake 概率
+
+        # ---- CLS 级别相似度 ----
+        real_cls_sim = torch.sum(cls_features * real_face, dim=-1)  # [B]
+        fake_cls_sim = torch.sum(cls_features * fake_face, dim=-1)  # [B]
+
+        cls_logits = torch.stack([real_cls_sim, fake_cls_sim], dim=-1)   # [B,2]
+        cls_prob = torch.softmax(cls_logits, dim=1)[:, 1]                # fake 概率
+
+        return patch_logits_flat, patch_prob, cls_logits, cls_prob
+
+    # =================== mask / loss / metric ===================
+
+    def process_tensor(self, label):
+        """
+        输入:
+          label: [B, H, W] 或 [B, H, W, 1]
+        返回:
+          [B, P] 的 0/1 标签, P = seg_size * seg_size
+        """
+        P = self.seg_size * self.seg_size
+        # print(label.shape)
+        # ---------- 1. 基本合法性检查 ----------
+        if not isinstance(label, torch.Tensor):
+            # 连 tensor 都不是，构一个最小的 0
+            return torch.zeros(1, P, dtype=torch.long)
+        
+        device = label.device
+        # print(label.dim(),label.shape)
+        # print(torch.sum(label.reshape(-1)))
+        
+ 
+        
+        label = label[:,:,:,0].unsqueeze(1)  # [B,1,H,W]
+        B = label.shape[0]
+        
+        
+        # print(torch.sum(label.reshape(-1)))
+        # 下采样到 seg_size x seg_size
+        downsampled = F.interpolate(
+            label,
+            size=(self.seg_size, self.seg_size),
+            mode='area'
+        )  # [B,1,S,S]
+        # print(downsampled.shape,torch.sum(downsampled.reshape(-1)))
+        label = (downsampled.squeeze(1)>0.1).view(B, -1).long()  # [B,P]
+        return label
+
+
+    def process_tensor_soft(self, label):
+        P = self.seg_size * self.seg_size
+        if not isinstance(label, torch.Tensor):
+            return torch.zeros(1, P, dtype=torch.float32)
+
+        device = label.device
+        
+        B = label.shape[0] if label.dim() >= 1 else 1
+        # ---- 统一成 [B,1,H,W] 的 float ----
+        if label.dim() == 4:
+            # [B,1,H,W]
+            if label.shape[1] == 1:
+
+                mask = label
+            # [B,3,H,W]
+            elif label.shape[1] == 3:
+                mask = label[:, :1, :, :]      # 取第0通道
+            # [B,H,W,1] or [B,H,W,3]
+            elif label.shape[-1] in (1, 3):
+                mask = label.permute(0, 3, 1, 2)[:, :1, :, :]
+            else:
+                return torch.zeros(B, P, dtype=torch.float32, device=device)
+        elif label.dim() == 3:
+            # [B,H,W]
+            mask = label.unsqueeze(1)
+        else:
+
+            return torch.zeros(B, P, dtype=torch.float32, device=device)
+
+        mask = mask.float()  # [B,1,H,W]
+
+        # 0/255 → 0/1
+        max_val = mask.max()
+        if max_val > 1.5:
+            mask = mask / 255.0
+        
+
+        downsampled = F.interpolate(
+            mask,
+            size=(self.seg_size, self.seg_size),
+            mode='area'
+        )  # [B,1,S,S]
+
+        patch_fake_prob = downsampled.squeeze(1).view(B, -1).clamp(0.0, 1.0)  # [B,P]
+        return patch_fake_prob
+
+
+
+    @staticmethod
+    def soft_ce_loss(logits, target_probs):
+        """
+        logits: [N, 2] 未归一化
+        target_probs: [N, 2] 每一行和为1的 soft label
+        """
+        log_probs = F.log_softmax(logits, dim=-1)      # [N,2]
+        loss = -(target_probs * log_probs).sum(dim=-1) # [N]
+        return loss.mean()
+
+
+
+    def get_losses(self, data_dict: dict, pred_dict: dict) -> dict:
+        # patch loss
+        cls_label = data_dict['label']                      # [B]
+        # print('cls',cls_label.shape[0],torch.sum(cls_label.reshape(-1)))
+        cls_pred = pred_dict['cls']                         # [B,2]
+        loss = self.loss_func(cls_pred, cls_label)
+        loss_patch = 0
+        if(self.training):
+            patch_label = self.get_masks(data_dict)
+            patch_label = self.process_tensor(patch_label)      # [B,P]
+            B, P = patch_label.shape
+            patch_label = patch_label.reshape(-1)               # [B*P]
+            patch_pred = pred_dict['patch_cls']                 # [B*P,2]
+            patch_loss = self.loss_func(patch_pred, patch_label)
+            loss = loss + patch_loss * 0.25 # * 0.2 
+        return {'overall': loss}
+        # return {'overall': loss,'loss_patch':loss_patch}
+
+    # def get_losses(self, data_dict: dict, pred_dict: dict) -> dict:
+    #     # ===== patch soft-label loss =====
+    #     patch_mask = self.get_masks(data_dict)              # 原始 [B,H,W,3] mask
+        # print(patch_mask)
+        # exit(0)
+    #     patch_fake_prob = self.process_tensor_soft(patch_mask)  # [B,P] ∈ [0,1]
+    #     B, P = patch_fake_prob.shape
+
+        # soft target: [p_real, p_fake] = [1-p_fake, p_fake]
+    #     patch_fake_prob_flat = patch_fake_prob.view(-1)         # [B*P]
+    #     patch_real_prob_flat = 1.0 - patch_fake_prob_flat       # [B*P]
+    #     patch_target = torch.stack(
+    #         [patch_real_prob_flat, patch_fake_prob_flat], dim=-1
+    #     )                                                       # [B*P, 2]
+
+    #     patch_pred = pred_dict['patch_cls']                     # [B*P, 2]
+    #     # patch_loss = self.soft_ce_loss(patch_pred, patch_target)
+    #     patch_loss = self.loss_func(patch_pred, patch_label)
+
+    #     # ===== 图片级 cls loss 仍然用原来的 hard label =====
+    #     cls_label = data_dict['label']                      # [B]
+    #     cls_pred = pred_dict['cls']                         # [B,2]
+    #     cls_loss = self.loss_func(cls_pred, cls_label)
+
+    #     loss = patch_loss * 0.2 + cls_loss
+    #     return {'overall': loss}
+
+
+
+    def get_train_metrics(self, data_dict: dict, pred_dict: dict) -> dict:
+        with torch.no_grad():
+            cls_label = data_dict['label']
+            cls_pred = pred_dict['cls']
+            auc, eer, acc, ap = calculate_metrics_for_train(
+                cls_label.detach(), cls_pred.detach()
+            )
+            return {'acc': acc, 'auc': auc, 'eer': eer, 'ap': ap}
+
+    # =================== 可视化辅助 ===================
+
+    def create_fake_segmentation_map(self, pred_dict: dict):
+        """
+        从 patch logits 中取第一个样本，生成 seg_size×seg_size 的 0/255 mask
+        """
+        patch_logits = pred_dict['patch_cls']          # [B*P,2]
+        P = self.target_num_patches
+
+        data = patch_logits[:P, :]                     # [P,2]
+        fake_mask = (data[:, 1].detach().cpu().numpy() >
+                     data[:, 0].detach().cpu().numpy()).astype(np.uint8)  # [P]
+
+        fake_mask_2d = fake_mask.reshape(self.seg_size, self.seg_size)    # [S,S]
+        segmentation_map = fake_mask_2d * 255
+        return segmentation_map
+
+    def visualize_segmentation(self, segmentation_map):
+        os.makedirs(self.mask_save_path, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        filename = f"seg_map_{timestamp}.png"
+        save_path = os.path.join(self.mask_save_path, filename)
+
+        plt.figure(figsize=(6, 6))
+        plt.imshow(segmentation_map, cmap='gray', vmin=0, vmax=255)
+        plt.title(f'{self.seg_size}x{self.seg_size} 伪造分割图 (白色为伪造，黑色为真实)')
+        plt.axis('off')
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+
+
+# 辅助函数：创建模型实例
+def create_16x16_segmentor(config=None):
+    if config is None:
+        config = {'model_name': "openai/clip-vit-base-patch16"}
+    return CLIP16x16Segmentor(config)
+
